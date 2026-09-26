@@ -452,7 +452,10 @@ private slots:
             for (int c = 0; c < channels; ++c) {
                 for (int i = 0; i < refFrames; ++i) {
                     int ix = i + offset;
-                    if (ix < read) {
+                    if (ix < 0) {
+                        // nothing was decoded for this frame (see below)
+                        diffs[c].push_back(0.f);
+                    } else if (ix < read) {
                         float signeddiff =
                             test[ix * channels + c] -
                             reference[i * channels + c];
@@ -477,6 +480,15 @@ private slots:
 
             for (int i = 0; i < refFrames; ++i) {
                 int ix = i + offset;
+
+                // A decode found to start early (a negative offset, which
+                // only gapless reads correct above) has no sample for the
+                // first reference frames: there is nothing to compare,
+                // and reading test[] there would be out of bounds
+                if (ix < 0) {
+                    continue;
+                }
+                
                 if (ix >= read) {
                     SVCERR << "ERROR: audiofile " << audiofile << " reads truncated (read-rate reference frames " << i << " onward, of " << refFrames << ", are lost)" << endl;
                     QVERIFY(ix < read);
@@ -517,11 +529,11 @@ private slots:
             cerr << "channel " << c << ":  max diff " << maxDiff << " at " << maxIndex << endl;
             */            
             if (rmsDiff >= rmsLimit) {
-                SVCERR << "ERROR: for audiofile " << audiofile << ": RMS diff = " << rmsDiff << " for channel " << c << " (limit = " << rmsLimit << ")" << endl;
+                SVCERR << "ERROR: for audiofile " << audiofile << ": RMS diff = " << rmsDiff << " for channel " << c << " (limit = " << rmsLimit << ", offset = " << offset << ")" << endl;
                 QVERIFY(rmsDiff < rmsLimit);
             }
             if (maxDiff >= maxLimit) {
-                SVCERR << "ERROR: for audiofile " << audiofile << ": max diff = " << maxDiff << " at frame " << maxIndex << " of " << read << " on channel " << c << " (limit = " << maxLimit << ", edge limit = " << edgeLimit << ", mean diff = " << meanDiff << ", rms = " << rmsDiff << ")" << endl;
+                SVCERR << "ERROR: for audiofile " << audiofile << ": max diff = " << maxDiff << " at frame " << maxIndex << " of " << read << " on channel " << c << " (limit = " << maxLimit << ", edge limit = " << edgeLimit << ", mean diff = " << meanDiff << ", rms = " << rmsDiff << ", offset = " << offset << ")" << endl;
                 QVERIFY(maxDiff < maxLimit);
             }
 
