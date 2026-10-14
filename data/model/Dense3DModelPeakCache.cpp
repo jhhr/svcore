@@ -21,21 +21,27 @@
 
 namespace sv {
 
+static ModelId validateSource(ModelId sourceId)
+{
+    auto source = ModelById::getAs<DenseThreeDimensionalModel>(sourceId);
+    if (!source) {
+        SVCERR << "WARNING: Dense3DModelPeakCache constructed for unknown or wrong-type source model id " << sourceId << endl;
+        return ModelId();
+    } else {
+        return sourceId;
+    }
+}
+
 Dense3DModelPeakCache::Dense3DModelPeakCache(ModelId sourceId,
                                              int columnsPerPeak) :
-    m_source(sourceId),
+    m_source(validateSource(sourceId)),
     m_columnsPerPeak(columnsPerPeak),
     m_finalColumnIncomplete(false)
 {
-    auto source = ModelById::getAs<DenseThreeDimensionalModel>(m_source);
-    if (!source) {
-        SVCERR << "WARNING: Dense3DModelPeakCache constructed for unknown or wrong-type source model id " << m_source << endl;
-        m_source = {};
-        return;
+    if (!m_source.isNone()) {
+        connect(ModelById::get(m_source).get(), &Model::modelChanged,
+                this, &Dense3DModelPeakCache::sourceModelChanged);
     }
-
-    connect(source.get(), SIGNAL(modelChanged(ModelId)),
-            this, SLOT(sourceModelChanged(ModelId)));
 }
 
 Dense3DModelPeakCache::~Dense3DModelPeakCache()

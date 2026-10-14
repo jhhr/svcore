@@ -35,6 +35,19 @@ using namespace std;
 
 namespace sv {
 
+static thread_local unordered_map<int, shared_ptr<breakfastquay::FFT>> fftMap;
+
+struct SavedFFTColumn {
+    const FFTModel *model;      // requesting model (used for comparison only)
+    int n;                      // column number
+    doublecomplexvec_t col;
+};
+typedef std::vector<SavedFFTColumn> SmallCache;
+
+static thread_local SmallCache smallCache;
+static thread_local int smallCacheWriteIndex = 0;
+static constexpr size_t smallCacheSize = 16;
+
 static HitCount inSmallCache("FFTModel: Small FFT cache");
 static HitCount inSourceCache("FFTModel: Source data cache");
 
@@ -52,21 +65,14 @@ FFTModel::FFTModel(ModelId modelId,
     m_windowIncrement(windowIncrement),
     m_fftSize(fftSize),
     m_windower(windowType, windowSize),
-    m_fft(fftSize),
-    m_maximumFrequency(0.0),
-    m_cacheWriteIndex(0),
-    m_cacheSize(3)
+    m_maximumFrequency(0.0)
 {
-    clearCaches();
-    
     if (m_windowSize > m_fftSize) {
         SVCERR << "ERROR: FFTModel::FFTModel: window size (" << m_windowSize
                << ") may not exceed FFT size (" << m_fftSize << ")" << endl;
         throw invalid_argument("FFTModel window size may not exceed FFT size");
     }
-
-    m_fft.initFloat();
-
+    
     auto model = ModelById::getAs<DenseTimeValueModel>(m_model);
     if (model) {
         m_sampleRate = model->getSampleRate();
@@ -79,20 +85,27 @@ FFTModel::FFTModel(ModelId modelId,
     } else {
         m_error = QString("Model #%1 is not available").arg(m_model.untyped);
     }
+
+    m_savedData.range = { 0, 0 };
 }
 
 FFTModel::~FFTModel()
 {
+    clearCaches();
 }
 
 void
 FFTModel::clearCaches()
 {
-    m_cached.clear();
-    while (m_cached.size() < m_cacheSize) {
-        m_cached.push_back({ -1, doublecomplexvec_t(m_fftSize / 2 + 1) });
+    // Avoid cache slots being wrongly reused by any future model
+    // created at the same address
+    for (auto &incache : smallCache) {
+        if (incache.model == this) {
+            incache.model = nullptr;
+        }
     }
-    m_cacheWriteIndex = 0;
+
+    QMutexLocker locker(&m_mutex);
     m_savedData.range = { 0, 0 };
 }
 
@@ -126,6 +139,8 @@ void
 FFTModel::setMaximumFrequency(double freq)
 {
     m_maximumFrequency = freq;
+
+    // This call changes the column height, so cached values are no longer valid
     clearCaches();
 }
 
@@ -181,6 +196,20 @@ FFTModel::getColumn(int x, int minbin, int nbins) const
 {
     Profiler profiler("FFTModel::getColumn (subset)");
     auto cplx = getFFTColumn(x);
+    Column col;
+    col.reserve(nbins);
+    for (int i = 0; i < nbins; ++i) {
+        col.push_back(abs(cplx[minbin + i]));
+    }
+    return col;
+}
+
+FFTModel::Column
+FFTModel::getColumnWithoutCache(int x, int minbin, int nbins) const
+{
+    Profiler profiler("FFTModel::getColumnWithoutCache (subset)");
+    doublecomplexvec_t cplx;
+    getFFTColumnUncached(x, cplx);
     Column col;
     col.reserve(nbins);
     for (int i = 0; i < nbins; ++i) {
@@ -318,6 +347,8 @@ FFTModel::getSourceData(pair<sv_frame_t, sv_frame_t> range) const
             << "," << m_savedData.range.second << ")" << endl;
 #endif
 
+    QMutexLocker locker(&m_mutex);
+
     if (m_savedData.range == range) {
         inSourceCache.hit();
 #ifdef DEBUG_FFT_MODEL
@@ -424,44 +455,75 @@ FFTModel::getSourceDataUncached(pair<sv_frame_t, sv_frame_t> range) const
 const doublecomplexvec_t &
 FFTModel::getFFTColumn(int n) const
 {
-    // The small cache (i.e. the m_cached deque) is for cases where
-    // values are looked up individually, and for e.g. peak-frequency
-    // spectrograms where values from two consecutive columns are
-    // needed at once. This cache gets essentially no hits when
-    // scrolling through a magnitude spectrogram, but 95%+ hits with a
-    // peak-frequency spectrogram or spectrum.
-    for (const auto &incache : m_cached) {
-        if (incache.n == n) {
+    Profiler profiler("FFTModel::getFFTColumn");
+
+    // The small cache is for cases where values are looked up
+    // individually, and for e.g. peak-frequency spectrograms where
+    // values from two consecutive columns are needed at once. This
+    // cache is seldom used when e.g. scrolling through a magnitude
+    // spectrogram, but gets a lot of hits with a peak-frequency
+    // spectrogram or spectrum.
+
+    // Note that the small cache is thread-local, so no mutex
+
+    for (int i = 0; in_range_for(smallCache, i); ++i) {
+        const auto &incache = smallCache.at(i);
+        if (incache.model == this && incache.n == n) {
             inSmallCache.hit();
+//            cerr << "*HIT* at " << i << " with model = " << this << " and n = " << n << endl;
             return incache.col;
         }
     }
+        
     inSmallCache.miss();
 
-    Profiler profiler("FFTModel::getFFTColumn (cache miss)");
+    while (smallCache.size() < smallCacheSize) {
+        smallCache.push_back({ nullptr, -1, doublecomplexvec_t() });
+    }
+    
+    int ix = smallCacheWriteIndex;
+
+    doublecomplexvec_t &col = smallCache[ix].col;
+    
+    getFFTColumnUncached(n, col);
+
+    smallCache[ix].model = this;
+    smallCache[ix].n = n;
+
+//    cerr << "wrote at " << ix << " with model = " << this << " and n = " << n << endl;
+
+    smallCacheWriteIndex = (ix + 1) % smallCacheSize;
+
+//    cerr << "smallCacheWriteIndex is now " << smallCacheWriteIndex << endl;
+
+    return col;
+}
+
+void
+FFTModel::getFFTColumnUncached(int n, doublecomplexvec_t &col) const
+{
+//    Profiler profiler("FFTModel::getFFTColumnUncached");
+
+    if (fftMap.find(m_fftSize) == fftMap.end()) {
+        fftMap[m_fftSize] = make_shared<breakfastquay::FFT>(m_fftSize);
+        fftMap[m_fftSize]->initDouble();
+    }
     
     auto fsamples = getSourceSamples(n);
 
     // Ensure that windowing and FFT happen in double precision
-    vector<double> samples;
-    samples.reserve(fsamples.size());
-    for (int i = 0; in_range_for(fsamples, i); ++i) {
-        samples.push_back(fsamples[i]);
-    }
-    
+    vector<double> samples(m_fftSize);
+    breakfastquay::v_convert(samples.data(), fsamples.data(), m_fftSize);
     m_windower.cut(samples.data() + (m_fftSize - m_windowSize) / 2);
     breakfastquay::v_fftshift(samples.data(), m_fftSize);
 
-    doublecomplexvec_t &col = m_cached[m_cacheWriteIndex].col;
+    col.resize(m_fftSize/2 + 1);
 
-    // expand to large enough for fft destination, if truncated previously
-    col.resize(m_fftSize / 2 + 1);
+    // thread-local FFT (breakfastquay::FFT is not thread-safe)
+    fftMap[m_fftSize]->forwardInterleaved
+        (samples.data(), reinterpret_cast<double *>(col.data()));
 
-    m_fft.forwardInterleaved(samples.data(),
-                             reinterpret_cast<double *>(col.data()));
-
-    // keep only the number of elements we need - so that we can
-    // return a const ref without having to resize on a cache hit
+    // keep only the number of elements we need
     col.resize(getHeight());
 
 #ifdef DEBUG_FFT_MODEL
@@ -477,12 +539,6 @@ FFTModel::getFFTColumn(int n) const
                 << breakfastquay::v_max(mags.data(), mags.size()) << endl;
     }
 #endif
-    
-    m_cached[m_cacheWriteIndex].n = n;
-
-    m_cacheWriteIndex = (m_cacheWriteIndex + 1) % m_cacheSize;
-
-    return col;
 }
 
 bool
@@ -522,39 +578,66 @@ FFTModel::estimateStableFrequency(int x, int y, double &frequency)
     return true;
 }
 
-FFTModel::PeakLocationSet
+FFTModel::PeakLocations
 FFTModel::getPeaks(PeakPickType type, int x, int ymin, int ymax) const
 {
     Profiler profiler("FFTModel::getPeaks");
-    
-    FFTModel::PeakLocationSet peaks;
-    if (!isOK()) return peaks;
 
+    return getPeaksAndColumn(type, x, ymin, ymax, nullptr);
+}
+
+FFTModel::PeakLocations
+FFTModel::getPeaksAndColumn(PeakPickType type, int x, int ymin, int ymax,
+                            doublecomplexvec_t *colReturn) const
+{    
+    FFTModel::PeakLocations peaks;
+    if (!isOK()) {
+        if (colReturn) {
+            *colReturn = {};
+        }
+        return peaks;
+    }
+    
     if (ymax == 0 || ymax > getHeight() - 1) {
         ymax = getHeight() - 1;
     }
 
+    doublecomplexvec_t col = getFFTColumn(x);
+    if (colReturn) {
+        *colReturn = col;
+    }
+
     if (type == AllPeaks) {
+        
         int minbin = ymin;
         if (minbin > 0) minbin = minbin - 1;
         int maxbin = ymax;
         if (maxbin < getHeight() - 1) maxbin = maxbin + 1;
         const int n = maxbin - minbin + 1;
-        float *values = new float[n];
-        getMagnitudesAt(x, values, minbin, maxbin - minbin + 1);
+
+        Column values;
+        values.reserve(n);
+        for (int i = 0; i < n; ++i) {
+            values.push_back(abs(col[minbin + i]));
+        }
+
         for (int bin = ymin; bin <= ymax; ++bin) {
-            if (bin == minbin || bin == maxbin) continue;
+            if (bin == minbin || bin == maxbin - 1) continue;
             if (values[bin - minbin] > values[bin - minbin - 1] &&
                 values[bin - minbin] > values[bin - minbin + 1]) {
-                peaks.insert(bin);
+                peaks.push_back(bin);
             }
         }
-        delete[] values;
+        
         return peaks;
     }
 
-    Column values = getColumn(x);
-    int nv = int(values.size());
+    int nv = int(col.size());
+    Column values;
+    values.reserve(nv);
+    for (int i = 0; i < nv; ++i) {
+        values.push_back(abs(col[i]));
+    }
 
     float mean = 0.f;
     for (int i = 0; i < nv; ++i) mean += values[i];
@@ -630,7 +713,7 @@ FFTModel::getPeaks(PeakPickType type, int x, int ymin, int ymax) const
                     }
                     inrange.clear();
                     if (peakbin >= ymin && peakbin <= ymax) {
-                        peaks.insert(peakbin);
+                        peaks.push_back(peakbin);
                     }
                 }
             }
@@ -686,16 +769,23 @@ FFTModel::getPeakPickWindowSize(PeakPickType type, sv_samplerate_t sampleRate,
     return medianWinSize;
 }
 
-FFTModel::PeakSet
+FFTModel::Peaks
 FFTModel::getPeakFrequencies(PeakPickType type, int x,
                              int ymin, int ymax) const
 {
     Profiler profiler("FFTModel::getPeakFrequencies");
 
-    PeakSet peaks;
-    if (!isOK()) return peaks;
-    PeakLocationSet locations = getPeaks(type, x, ymin, ymax);
+    Peaks peaks;
+    if (!isOK() || x >= getWidth()) {
+        return peaks;
+    }
 
+    doublecomplexvec_t col;
+    PeakLocations locations = getPeaksAndColumn(type, x, ymin, ymax, &col);
+    peaks.reserve(locations.size());
+    
+    doublecomplexvec_t nextCol = getFFTColumn(x+1);
+    
     sv_samplerate_t sampleRate = getSampleRate();
     int incr = getResolution();
 
@@ -704,24 +794,16 @@ FFTModel::getPeakFrequencies(PeakPickType type, int x,
     // columns, instead of jumping back and forth between columns x and
     // x+1, which may be significantly slower if re-seeking is needed
 
-    vector<float> phases;
-    for (PeakLocationSet::iterator i = locations.begin();
-         i != locations.end(); ++i) {
-        phases.push_back(getPhaseAt(x, *i));
-    }
-
-    int phaseIndex = 0;
-    for (PeakLocationSet::iterator i = locations.begin();
-         i != locations.end(); ++i) {
-        double oldPhase = phases[phaseIndex];
-        double newPhase = getPhaseAt(x+1, *i);
-        double expectedPhase = oldPhase + (2.0 * M_PI * *i * incr) / m_fftSize;
+    for (auto location : locations) {
+        double oldPhase = arg(col[location]);
+        double newPhase = arg(nextCol[location]);
+        double expectedPhase =
+            oldPhase + (2.0 * M_PI * location * incr) / m_fftSize;
         double phaseError = princarg(newPhase - expectedPhase);
         double frequency =
             (sampleRate * (expectedPhase + phaseError - oldPhase))
             / (2 * M_PI * incr);
-        peaks[*i] = frequency;
-        ++phaseIndex;
+        peaks.push_back({ location, frequency });
     }
 
     return peaks;

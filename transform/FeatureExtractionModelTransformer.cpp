@@ -40,6 +40,7 @@
 #include <QSettings>
 
 //#define DEBUG_FEATURE_EXTRACTION_TRANSFORMER_RUN 1
+//#define PRINT_DETAILED_FEATURE_TIMINGS 1
 
 namespace sv {
 
@@ -446,7 +447,7 @@ FeatureExtractionModelTransformer::createOutputModels(int n)
         
         // Regions do not have units of Hz or MIDI things (a sweeping
         // assumption!)
-        if (m_descriptors[n].unit == "Hz" ||
+        if (UnitDatabase::asCommonUnit(m_descriptors[n].unit.c_str()) == "Hz" ||
             m_descriptors[n].unit.find("MIDI") != std::string::npos ||
             m_descriptors[n].unit.find("midi") != std::string::npos) {
             isNoteModel = true;
@@ -1079,11 +1080,13 @@ FeatureExtractionModelTransformer::addFeature(int n,
 
     sv_samplerate_t inputRate = input->getSampleRate();
 
-//    cerr << "FeatureExtractionModelTransformer::addFeature: blockFrame = "
-//              << blockFrame << ", hasTimestamp = " << feature.hasTimestamp
-//              << ", timestamp = " << feature.timestamp << ", hasDuration = "
-//              << feature.hasDuration << ", duration = " << feature.duration
-//              << endl;
+#ifdef PRINT_DETAILED_FEATURE_TIMINGS
+    std::cerr << "FeatureExtractionModelTransformer::addFeature: blockFrame = "
+              << blockFrame << ", hasTimestamp = " << feature.hasTimestamp
+              << ", timestamp = " << feature.timestamp << ", hasDuration = "
+              << feature.hasDuration << ", duration = " << feature.duration
+              << ", label = " << feature.label << std::endl;
+#endif
 
     sv_frame_t frame = blockFrame;
 
@@ -1100,8 +1103,10 @@ FeatureExtractionModelTransformer::addFeature(int n,
             frame = RealTime::realTime2Frame(feature.timestamp, inputRate);
         }
 
-//        cerr << "variable sample rate: timestamp = " << feature.timestamp
-//             << " at input rate " << inputRate << " -> " << frame << endl;
+#ifdef PRINT_DETAILED_FEATURE_TIMINGS
+        std::cerr << "variable sample rate: timestamp = " << feature.timestamp
+                  << " at input rate " << inputRate << " -> " << frame << std::endl;
+#endif
         
     } else if (m_descriptors[n].sampleType ==
                Vamp::Plugin::OutputDescriptor::FixedSampleRate) {
@@ -1118,12 +1123,18 @@ FeatureExtractionModelTransformer::addFeature(int n,
             m_fixedRateFeatureNos[n] = (int)lrint(ts.toDouble() * rate);
         }
 
-//        cerr << "m_fixedRateFeatureNo = " << m_fixedRateFeatureNos[n]
-//             << ", m_descriptor->sampleRate = " << m_descriptors[n].sampleRate
-//             << ", inputRate = " << inputRate
-//             << " giving frame = ";
+#ifdef PRINT_DETAILED_FEATURE_TIMINGS
+        std::cerr << "m_fixedRateFeatureNo = " << m_fixedRateFeatureNos[n]
+                  << ", m_descriptor->sampleRate = " << m_descriptors[n].sampleRate
+                  << ", inputRate = " << inputRate
+                  << " giving frame = ";
+#endif
+        
         frame = lrint((double(m_fixedRateFeatureNos[n]) / rate) * inputRate);
-//        cerr << frame << endl;
+
+#ifdef PRINT_DETAILED_FEATURE_TIMINGS
+        std::cerr << frame << std::endl;
+#endif
     }
 
     if (frame < 0) {
@@ -1134,6 +1145,11 @@ FeatureExtractionModelTransformer::addFeature(int n,
             << "), dropping feature" 
             << endl;
         return;
+    }
+
+    int nvalues = int(feature.values.size());
+    if (m_descriptors[n].hasFixedBinCount) {
+        nvalues = std::min(nvalues, int(m_descriptors[n].binCount));
     }
 
     // Rather than repeat the complicated tests from the constructor
@@ -1154,12 +1170,12 @@ FeatureExtractionModelTransformer::addFeature(int n,
         auto model = ModelById::getAs<SparseTimeValueModel>(outputId);
         if (!model) return;
 
-        for (int i = 0; in_range_for(feature.values, i); ++i) {
+        for (int i = 0; i < nvalues; ++i) {
 
             float value = feature.values[i];
 
             QString label = feature.label.c_str();
-            if (feature.values.size() > 1) {
+            if (nvalues > 1) {
                 label = QString("[%1] %2").arg(i+1).arg(label);
             }
 
@@ -1179,7 +1195,7 @@ FeatureExtractionModelTransformer::addFeature(int n,
         int index = 0;
 
         float value = 0.0;
-        if ((int)feature.values.size() > index) {
+        if (nvalues > index) {
             value = feature.values[index++];
         }
 
@@ -1187,7 +1203,7 @@ FeatureExtractionModelTransformer::addFeature(int n,
         if (feature.hasDuration) {
             duration = RealTime::realTime2Frame(feature.duration, inputRate);
         } else {
-            if (in_range_for(feature.values, index)) {
+            if (nvalues > index) {
                 duration = lrintf(feature.values[index++]);
             }
         }
@@ -1196,7 +1212,7 @@ FeatureExtractionModelTransformer::addFeature(int n,
         if (noteModel) {
 
             float velocity = 100;
-            if ((int)feature.values.size() > index) {
+            if (nvalues > index) {
                 velocity = feature.values[index++];
             }
             if (velocity < 0) velocity = 127;
@@ -1211,14 +1227,14 @@ FeatureExtractionModelTransformer::addFeature(int n,
         auto regionModel = ModelById::getAs<RegionModel>(outputId);
         if (regionModel) {
             
-            if (feature.hasDuration && !feature.values.empty()) {
-                
-                for (int i = 0; in_range_for(feature.values, i); ++i) {
+            if (feature.hasDuration && nvalues > 0) {
+
+                for (int i = 0; i < nvalues; ++i) {
                     
                     float value = feature.values[i];
                     
                     QString label = feature.label.c_str();
-                    if (feature.values.size() > 1) {
+                    if (nvalues > 1) {
                         label = QString("[%1] %2").arg(i+1).arg(label);
                     }
                     
@@ -1244,7 +1260,10 @@ FeatureExtractionModelTransformer::addFeature(int n,
         
         DenseThreeDimensionalModel::Column values;
         values.insert(values.begin(),
-                      feature.values.begin(), feature.values.end());
+                      // not begin() to end(), as we want to limit to
+                      // hasFixedBinCount even if the plugin happens
+                      // to return more
+                      feature.values.begin(), feature.values.begin() + nvalues);
         
         if (!feature.hasTimestamp && m_fixedRateFeatureNos[n] >= 0) {
             model->setColumn(m_fixedRateFeatureNos[n], values);

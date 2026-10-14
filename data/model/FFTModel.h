@@ -26,6 +26,7 @@
 
 #include <set>
 #include <vector>
+#include <thread>
 #include <complex>
 
 namespace sv {
@@ -39,9 +40,9 @@ class FFTModel : public DenseThreeDimensionalModel
 {
     Q_OBJECT
 
-    //!!! threading requirements?
-    //!!! doubles? since we're not caching much
-
+    // NB like all models this has to be thread-safe against multiple
+    // threads querying data at once
+    
 public:
     /**
      * Construct an FFT model derived from the given
@@ -92,6 +93,8 @@ public:
 
     Column getColumn(int x) const override; // magnitudes
     Column getColumn(int x, int minbin, int nbins) const override; // magnitudes
+
+    Column getColumnWithoutCache(int x, int minbin, int nbins) const; // magnitudes
 
     bool hasBinValues() const override {
         return true;
@@ -153,21 +156,21 @@ public:
         MajorPitchAdaptivePeaks  /// Bigger window for higher frequencies
     };
 
-    typedef std::set<int> PeakLocationSet; // bin
-    typedef std::map<int, double> PeakSet; // bin -> freq
+    typedef std::vector<int> PeakLocations; // bin (in order)
+    typedef std::vector<std::pair<int, double>> Peaks; // bin, freq (in bin order)
 
     /**
      * Return locations of peak bins in the range [ymin,ymax].  If
      * ymax is zero, getHeight()-1 will be used.
      */
-    virtual PeakLocationSet getPeaks(PeakPickType type, int x,
-                                     int ymin = 0, int ymax = 0) const;
+    virtual PeakLocations getPeaks(PeakPickType type, int x,
+                                   int ymin = 0, int ymax = 0) const;
 
     /**
      * Return locations and estimated stable frequencies of peak bins.
      */
-    virtual PeakSet getPeakFrequencies(PeakPickType type, int x,
-                                       int ymin = 0, int ymax = 0) const;
+    virtual Peaks getPeakFrequencies(PeakPickType type, int x,
+                                     int ymin = 0, int ymax = 0) const;
 
     QString getTypeName() const override { return tr("FFT"); }
 
@@ -184,7 +187,6 @@ private:
     int m_windowIncrement;
     int m_fftSize;
     Window<double> m_windower;
-    mutable breakfastquay::FFT m_fft;
     double m_maximumFrequency;
     mutable QString m_error;
     
@@ -201,23 +203,19 @@ private:
     }
 
     const doublecomplexvec_t &getFFTColumn(int column) const;
+    void getFFTColumnUncached(int column, doublecomplexvec_t &) const;
     floatvec_t getSourceSamples(int column) const;
     floatvec_t getSourceData(std::pair<sv_frame_t, sv_frame_t>) const;
     floatvec_t getSourceDataUncached(std::pair<sv_frame_t, sv_frame_t>) const;
+    PeakLocations getPeaksAndColumn(PeakPickType type, int x,
+                                    int ymin, int ymax,
+                                    doublecomplexvec_t *column) const;
 
     struct SavedSourceData {
         std::pair<sv_frame_t, sv_frame_t> range;
         floatvec_t data;
     };
     mutable SavedSourceData m_savedData;
-
-    struct SavedColumn {
-        int n;
-        doublecomplexvec_t col;
-    };
-    mutable std::vector<SavedColumn> m_cached;
-    mutable size_t m_cacheWriteIndex;
-    size_t m_cacheSize;
 
     void clearCaches();
 };
